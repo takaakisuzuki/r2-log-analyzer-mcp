@@ -6,11 +6,6 @@ import { handleAccessRequest } from "./access-handler";
 import { decryptLogEntries, decryptMatchedData } from "./matched-data";
 import type { Props } from "./workers-oauth-utils";
 
-// Maximum number of log lines to process per request to avoid OOM
-const MAX_LOG_LINES = 5000;
-// Maximum number of R2 objects to read per query
-const MAX_OBJECTS_PER_QUERY = 10;
-
 /**
  * Decompress gzip content using DecompressionStream.
  */
@@ -46,13 +41,11 @@ function parseLogLines(text: string): Record<string, any>[] {
 	const lines = text.split("\n").filter((line) => line.trim().length > 0);
 	const results: Record<string, any>[] = [];
 	for (const line of lines) {
-		if (results.length >= MAX_LOG_LINES) break;
 		try {
 			const parsed = JSON.parse(line);
 			// If the entire content is a JSON array, flatten it
 			if (Array.isArray(parsed)) {
 				for (const item of parsed) {
-					if (results.length >= MAX_LOG_LINES) break;
 					results.push(item);
 				}
 			} else {
@@ -66,71 +59,106 @@ function parseLogLines(text: string): Record<string, any>[] {
 }
 
 /**
- * Read and parse log objects from R2 matching a given prefix.
+ * Check if a single log entry matches all filters (case-insensitive string comparison).
  */
-async function readLogsFromR2(
+function matchesFilters(
+	log: Record<string, any>,
+	filters: Record<string, string | number | boolean>,
+): boolean {
+	for (const [key, value] of Object.entries(filters)) {
+		const logValue = log[key];
+		if (logValue === undefined) return false;
+		if (typeof logValue === "string" && typeof value === "string") {
+			if (logValue.toLowerCase() !== value.toLowerCase()) return false;
+		} else if (logValue !== value) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Iterate ALL R2 objects under a prefix with cursor-based pagination.
+ * Processes each file one at a time to avoid holding all logs in memory.
+ * Return `false` from callback to stop early (e.g. when a specific entry is found).
+ */
+async function forEachLogInR2(
 	bucket: R2Bucket,
 	prefix: string,
-	maxObjects: number = MAX_OBJECTS_PER_QUERY,
-): Promise<Record<string, any>[]> {
-	const listed = await bucket.list({ prefix, limit: maxObjects });
-	const allLogs: Record<string, any>[] = [];
+	callback: (log: Record<string, any>) => boolean | void,
+): Promise<{ totalEntries: number; filesProcessed: number }> {
+	let cursor: string | undefined;
+	let filesProcessed = 0;
+	let totalEntries = 0;
+	let stopped = false;
 
-	for (const obj of listed.objects) {
-		if (allLogs.length >= MAX_LOG_LINES) break;
-		const r2Obj = await bucket.get(obj.key);
-		if (!r2Obj) continue;
+	do {
+		const listed = await bucket.list({
+			prefix,
+			limit: 100,
+			cursor,
+		});
 
-		const text = await readR2ObjectText(r2Obj, obj.key);
-		const parsed = parseLogLines(text);
-		allLogs.push(...parsed);
-	}
+		for (const obj of listed.objects) {
+			if (stopped) break;
+			const r2Obj = await bucket.get(obj.key);
+			if (!r2Obj) continue;
 
-	return allLogs.slice(0, MAX_LOG_LINES);
-}
+			const text = await readR2ObjectText(r2Obj, obj.key);
+			const logs = parseLogLines(text);
+			filesProcessed++;
 
-/**
- * Filter logs by field values. Supports simple equality matching.
- */
-function filterLogs(
-	logs: Record<string, any>[],
-	filters: Record<string, string | number | boolean>,
-): Record<string, any>[] {
-	return logs.filter((log) => {
-		for (const [key, value] of Object.entries(filters)) {
-			const logValue = log[key];
-			if (logValue === undefined) return false;
-			// Case-insensitive string comparison
-			if (typeof logValue === "string" && typeof value === "string") {
-				if (logValue.toLowerCase() !== value.toLowerCase()) return false;
-			} else if (logValue !== value) {
-				return false;
+			for (const log of logs) {
+				totalEntries++;
+				const result = callback(log);
+				if (result === false) {
+					stopped = true;
+					break;
+				}
 			}
 		}
-		return true;
-	});
+
+		cursor = listed.truncated ? listed.cursor : undefined;
+	} while (cursor && !stopped);
+
+	return { totalEntries, filesProcessed };
 }
 
 /**
- * Count occurrences of a field value and return top N.
+ * Streaming aggregator that counts field values without storing raw logs in memory.
+ * Only keeps Map<field, Map<value, count>> — O(unique values) memory instead of O(total logs).
  */
-function topN(
-	logs: Record<string, any>[],
-	field: string,
-	n: number,
-): { value: string; count: number }[] {
-	const counts = new Map<string, number>();
-	for (const log of logs) {
-		const val = log[field];
-		if (val !== undefined && val !== null) {
-			const key = String(val);
-			counts.set(key, (counts.get(key) || 0) + 1);
+class StreamingAggregator {
+	private counters = new Map<string, Map<string, number>>();
+	private _total = 0;
+
+	get total() {
+		return this._total;
+	}
+
+	add(log: Record<string, any>, fields: string[]) {
+		this._total++;
+		for (const field of fields) {
+			const val = log[field];
+			if (val !== undefined && val !== null) {
+				const key = String(val);
+				if (!this.counters.has(field)) {
+					this.counters.set(field, new Map());
+				}
+				const fieldMap = this.counters.get(field)!;
+				fieldMap.set(key, (fieldMap.get(key) || 0) + 1);
+			}
 		}
 	}
-	return Array.from(counts.entries())
-		.map(([value, count]) => ({ value, count }))
-		.sort((a, b) => b.count - a.count)
-		.slice(0, n);
+
+	topN(field: string, n: number): { value: string; count: number }[] {
+		const fieldMap = this.counters.get(field);
+		if (!fieldMap) return [];
+		return Array.from(fieldMap.entries())
+			.map(([value, count]) => ({ value, count }))
+			.sort((a, b) => b.count - a.count)
+			.slice(0, n);
+	}
 }
 
 /**
@@ -233,7 +261,7 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"query_http_logs",
-			"Query and filter HTTP request logs stored in R2. Returns matching log entries from Cloudflare Logpush http_requests dataset. Key fields include: ClientIP, ClientCountry, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestURI, ClientRequestUserAgent, EdgeResponseStatus, EdgeColoCode, OriginResponseStatus, RayID, SecurityAction, BotScore, CacheCacheStatus, EdgeStartTimestamp, etc.",
+			"Query and filter HTTP request logs stored in R2. Scans ALL log files under the prefix (no sampling). Returns matching log entries from Cloudflare Logpush http_requests dataset. Key fields include: ClientIP, ClientCountry, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestURI, ClientRequestUserAgent, EdgeResponseStatus, EdgeColoCode, OriginResponseStatus, RayID, SecurityAction, BotScore, CacheCacheStatus, EdgeStartTimestamp, etc.",
 			{
 				prefix: z
 					.string()
@@ -260,18 +288,6 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					.describe("Maximum number of matching log entries to return."),
 			},
 			async ({ prefix, filters, fields, max_results }) => {
-				const logs = await readLogsFromR2(this.env.HTTP_LOG_BUCKET, prefix);
-
-				if (logs.length === 0) {
-					return {
-						content: [{ type: "text" as const, text: `No HTTP logs found under prefix "${prefix}".` }],
-					};
-				}
-
-				let filtered = filters ? filterLogs(logs, filters) : logs;
-				const totalMatched = filtered.length;
-				filtered = filtered.slice(0, max_results);
-
 				const defaultFields = [
 					"EdgeStartTimestamp",
 					"ClientIP",
@@ -285,23 +301,39 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					"SecurityAction",
 					"RayID",
 				];
-
 				const outputFields = fields || defaultFields;
-				const entries = filtered.map((log) => {
-					const entry: Record<string, any> = {};
-					for (const f of outputFields) {
-						if (log[f] !== undefined) {
-							entry[f] = log[f];
+				const results: Record<string, any>[] = [];
+				let totalMatched = 0;
+
+				const { totalEntries, filesProcessed } = await forEachLogInR2(
+					this.env.HTTP_LOG_BUCKET,
+					prefix,
+					(log) => {
+						if (!filters || matchesFilters(log, filters)) {
+							totalMatched++;
+							if (results.length < max_results) {
+								const entry: Record<string, any> = {};
+								for (const f of outputFields) {
+									if (log[f] !== undefined) entry[f] = log[f];
+								}
+								results.push(entry);
+							}
 						}
-					}
-					return entry;
-				});
+					},
+				);
+
+				if (totalEntries === 0) {
+					return {
+						content: [{ type: "text" as const, text: `No HTTP logs found under prefix "${prefix}".` }],
+					};
+				}
 
 				const summary = [
 					`HTTP Logs Query Results (prefix: "${prefix}")`,
-					`Total logs read: ${logs.length}`,
+					`Files processed: ${filesProcessed}`,
+					`Total logs scanned: ${totalEntries}`,
 					`Matched: ${totalMatched}`,
-					`Returned: ${entries.length}`,
+					`Returned: ${results.length}`,
 					filters ? `Filters: ${JSON.stringify(filters)}` : "No filters applied",
 					"---",
 				].join("\n");
@@ -310,7 +342,7 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					content: [
 						{
 							type: "text" as const,
-							text: summary + "\n" + JSON.stringify(entries, null, 2),
+							text: summary + "\n" + JSON.stringify(results, null, 2),
 						},
 					],
 				};
@@ -322,7 +354,7 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"query_firewall_logs",
-			"Query and filter WAF/firewall event logs stored in R2. Returns matching log entries from Cloudflare Logpush firewall_events dataset. Key fields include: Action, ClientIP, ClientCountry, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestUserAgent, Datetime, Description, EdgeColoCode, EdgeResponseStatus, RayID, RuleID, Source, Kind, MatchIndex, Metadata, etc.",
+			"Query and filter WAF/firewall event logs stored in R2. Scans ALL log files under the prefix (no sampling). Returns matching log entries from Cloudflare Logpush firewall_events dataset. Key fields include: Action, ClientIP, ClientCountry, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestUserAgent, Datetime, Description, EdgeColoCode, EdgeResponseStatus, RayID, RuleID, Source, Kind, MatchIndex, Metadata, etc.",
 			{
 				prefix: z
 					.string()
@@ -349,23 +381,6 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					.describe("Maximum number of matching log entries to return."),
 			},
 			async ({ prefix, filters, fields, max_results }) => {
-				let logs = await readLogsFromR2(this.env.WAF_LOG_BUCKET, prefix);
-
-				if (logs.length === 0) {
-					return {
-						content: [
-							{ type: "text" as const, text: `No firewall logs found under prefix "${prefix}".` },
-						],
-					};
-				}
-
-				// Auto-decrypt matched payloads if private key is configured
-				logs = await decryptLogEntries(logs, this.env.MATCHED_PAYLOAD_PRIVATE_KEY);
-
-				let filtered = filters ? filterLogs(logs, filters) : logs;
-				const totalMatched = filtered.length;
-				filtered = filtered.slice(0, max_results);
-
 				const defaultFields = [
 					"Datetime",
 					"Action",
@@ -382,21 +397,47 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					"RayID",
 					"Metadata",
 				];
-
 				const outputFields = fields || defaultFields;
-				const entries = filtered.map((log) => {
+				const results: Record<string, any>[] = [];
+				let totalMatched = 0;
+				const privateKey = this.env.MATCHED_PAYLOAD_PRIVATE_KEY;
+
+				const { totalEntries, filesProcessed } = await forEachLogInR2(
+					this.env.WAF_LOG_BUCKET,
+					prefix,
+					(log) => {
+						if (!filters || matchesFilters(log, filters)) {
+							totalMatched++;
+							if (results.length < max_results) {
+								results.push(log);
+							}
+						}
+					},
+				);
+
+				if (totalEntries === 0) {
+					return {
+						content: [
+							{ type: "text" as const, text: `No firewall logs found under prefix "${prefix}".` },
+						],
+					};
+				}
+
+				// Auto-decrypt matched payloads for collected results only
+				const decryptedResults = await decryptLogEntries(results, privateKey);
+
+				const entries = decryptedResults.map((log: Record<string, any>) => {
 					const entry: Record<string, any> = {};
 					for (const f of outputFields) {
-						if (log[f] !== undefined) {
-							entry[f] = log[f];
-						}
+						if (log[f] !== undefined) entry[f] = log[f];
 					}
 					return entry;
 				});
 
 				const summary = [
 					`Firewall Events Query Results (prefix: "${prefix}")`,
-					`Total logs read: ${logs.length}`,
+					`Files processed: ${filesProcessed}`,
+					`Total logs scanned: ${totalEntries}`,
 					`Matched: ${totalMatched}`,
 					`Returned: ${entries.length}`,
 					filters ? `Filters: ${JSON.stringify(filters)}` : "No filters applied",
@@ -419,7 +460,7 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"analyze_http_traffic",
-			"Analyze HTTP request logs to generate traffic summaries. Provides top-N rankings for IPs, countries, paths, status codes, user agents, cache status, and more.",
+			"Analyze HTTP request logs to generate traffic summaries. Scans ALL log files under the prefix (no sampling). Provides top-N rankings for IPs, countries, paths, status codes, user agents, cache status, and more.",
 			{
 				prefix: z
 					.string()
@@ -436,45 +477,62 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					.describe("Optional pre-filters to apply before analysis."),
 			},
 			async ({ prefix, top_n, filters }) => {
-				const logs = await readLogsFromR2(this.env.HTTP_LOG_BUCKET, prefix);
+				const analysisFields = [
+					"ClientIP", "ClientCountry", "ClientRequestHost",
+					"ClientRequestPath", "ClientRequestMethod",
+					"EdgeResponseStatus", "OriginResponseStatus",
+					"CacheCacheStatus", "ClientRequestUserAgent",
+					"EdgeColoCode", "SecurityAction", "ClientDeviceType",
+				];
+				const agg = new StreamingAggregator();
 
-				if (logs.length === 0) {
+				const { totalEntries, filesProcessed } = await forEachLogInR2(
+					this.env.HTTP_LOG_BUCKET,
+					prefix,
+					(log) => {
+						if (!filters || matchesFilters(log, filters)) {
+							agg.add(log, analysisFields);
+						}
+					},
+				);
+
+				if (totalEntries === 0) {
 					return {
 						content: [{ type: "text" as const, text: `No HTTP logs found under prefix "${prefix}".` }],
 					};
 				}
 
-				const filtered = filters ? filterLogs(logs, filters) : logs;
-
 				const analyses = [
 					`HTTP Traffic Analysis (prefix: "${prefix}")`,
-					`Total logs analyzed: ${filtered.length}`,
+					`Files processed: ${filesProcessed}`,
+					`Total logs scanned: ${totalEntries}`,
+					`Total logs analyzed (after filters): ${agg.total}`,
 					filters ? `Pre-filters: ${JSON.stringify(filters)}` : "",
 					"===",
 					"",
-					formatTopN(topN(filtered, "ClientIP", top_n), "Client IPs"),
+					formatTopN(agg.topN("ClientIP", top_n), "Client IPs"),
 					"",
-					formatTopN(topN(filtered, "ClientCountry", top_n), "Countries"),
+					formatTopN(agg.topN("ClientCountry", top_n), "Countries"),
 					"",
-					formatTopN(topN(filtered, "ClientRequestHost", top_n), "Request Hosts"),
+					formatTopN(agg.topN("ClientRequestHost", top_n), "Request Hosts"),
 					"",
-					formatTopN(topN(filtered, "ClientRequestPath", top_n), "Request Paths"),
+					formatTopN(agg.topN("ClientRequestPath", top_n), "Request Paths"),
 					"",
-					formatTopN(topN(filtered, "ClientRequestMethod", top_n), "HTTP Methods"),
+					formatTopN(agg.topN("ClientRequestMethod", top_n), "HTTP Methods"),
 					"",
-					formatTopN(topN(filtered, "EdgeResponseStatus", top_n), "Edge Response Status Codes"),
+					formatTopN(agg.topN("EdgeResponseStatus", top_n), "Edge Response Status Codes"),
 					"",
-					formatTopN(topN(filtered, "OriginResponseStatus", top_n), "Origin Response Status Codes"),
+					formatTopN(agg.topN("OriginResponseStatus", top_n), "Origin Response Status Codes"),
 					"",
-					formatTopN(topN(filtered, "CacheCacheStatus", top_n), "Cache Status"),
+					formatTopN(agg.topN("CacheCacheStatus", top_n), "Cache Status"),
 					"",
-					formatTopN(topN(filtered, "ClientRequestUserAgent", top_n), "User Agents"),
+					formatTopN(agg.topN("ClientRequestUserAgent", top_n), "User Agents"),
 					"",
-					formatTopN(topN(filtered, "EdgeColoCode", top_n), "Edge Colo Codes (Data Centers)"),
+					formatTopN(agg.topN("EdgeColoCode", top_n), "Edge Colo Codes (Data Centers)"),
 					"",
-					formatTopN(topN(filtered, "SecurityAction", top_n), "Security Actions"),
+					formatTopN(agg.topN("SecurityAction", top_n), "Security Actions"),
 					"",
-					formatTopN(topN(filtered, "ClientDeviceType", top_n), "Device Types"),
+					formatTopN(agg.topN("ClientDeviceType", top_n), "Device Types"),
 				].filter(Boolean);
 
 				return {
@@ -488,7 +546,7 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"analyze_waf_events",
-			"Analyze WAF/firewall event logs to generate security summaries. Provides top-N rankings for blocked IPs, actions, rules, sources, countries, and targeted paths.",
+			"Analyze WAF/firewall event logs to generate security summaries. Scans ALL log files under the prefix (no sampling). Provides top-N rankings for blocked IPs, actions, rules, sources, countries, and targeted paths.",
 			{
 				prefix: z
 					.string()
@@ -505,9 +563,25 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					.describe("Optional pre-filters to apply before analysis."),
 			},
 			async ({ prefix, top_n, filters }) => {
-				const logs = await readLogsFromR2(this.env.WAF_LOG_BUCKET, prefix);
+				const analysisFields = [
+					"Action", "Source", "ClientIP", "ClientCountry",
+					"ClientRequestHost", "ClientRequestPath",
+					"ClientRequestMethod", "RuleID", "Description",
+					"EdgeColoCode", "ClientRequestUserAgent",
+				];
+				const agg = new StreamingAggregator();
 
-				if (logs.length === 0) {
+				const { totalEntries, filesProcessed } = await forEachLogInR2(
+					this.env.WAF_LOG_BUCKET,
+					prefix,
+					(log) => {
+						if (!filters || matchesFilters(log, filters)) {
+							agg.add(log, analysisFields);
+						}
+					},
+				);
+
+				if (totalEntries === 0) {
 					return {
 						content: [
 							{ type: "text" as const, text: `No firewall logs found under prefix "${prefix}".` },
@@ -515,35 +589,35 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					};
 				}
 
-				const filtered = filters ? filterLogs(logs, filters) : logs;
-
 				const analyses = [
 					`WAF/Firewall Events Analysis (prefix: "${prefix}")`,
-					`Total events analyzed: ${filtered.length}`,
+					`Files processed: ${filesProcessed}`,
+					`Total events scanned: ${totalEntries}`,
+					`Total events analyzed (after filters): ${agg.total}`,
 					filters ? `Pre-filters: ${JSON.stringify(filters)}` : "",
 					"===",
 					"",
-					formatTopN(topN(filtered, "Action", top_n), "Actions"),
+					formatTopN(agg.topN("Action", top_n), "Actions"),
 					"",
-					formatTopN(topN(filtered, "Source", top_n), "Security Sources"),
+					formatTopN(agg.topN("Source", top_n), "Security Sources"),
 					"",
-					formatTopN(topN(filtered, "ClientIP", top_n), "Client IPs"),
+					formatTopN(agg.topN("ClientIP", top_n), "Client IPs"),
 					"",
-					formatTopN(topN(filtered, "ClientCountry", top_n), "Countries"),
+					formatTopN(agg.topN("ClientCountry", top_n), "Countries"),
 					"",
-					formatTopN(topN(filtered, "ClientRequestHost", top_n), "Targeted Hosts"),
+					formatTopN(agg.topN("ClientRequestHost", top_n), "Targeted Hosts"),
 					"",
-					formatTopN(topN(filtered, "ClientRequestPath", top_n), "Targeted Paths"),
+					formatTopN(agg.topN("ClientRequestPath", top_n), "Targeted Paths"),
 					"",
-					formatTopN(topN(filtered, "ClientRequestMethod", top_n), "HTTP Methods"),
+					formatTopN(agg.topN("ClientRequestMethod", top_n), "HTTP Methods"),
 					"",
-					formatTopN(topN(filtered, "RuleID", top_n), "Rule IDs"),
+					formatTopN(agg.topN("RuleID", top_n), "Rule IDs"),
 					"",
-					formatTopN(topN(filtered, "Description", top_n), "Rule Descriptions"),
+					formatTopN(agg.topN("Description", top_n), "Rule Descriptions"),
 					"",
-					formatTopN(topN(filtered, "EdgeColoCode", top_n), "Edge Colo Codes"),
+					formatTopN(agg.topN("EdgeColoCode", top_n), "Edge Colo Codes"),
 					"",
-					formatTopN(topN(filtered, "ClientRequestUserAgent", top_n), "User Agents"),
+					formatTopN(agg.topN("ClientRequestUserAgent", top_n), "User Agents"),
 				].filter(Boolean);
 
 				return {
@@ -557,7 +631,7 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"get_log_entry",
-			"Get the full details of a specific log entry by RayID. Searches through log files in the specified bucket to find the matching entry.",
+			"Get the full details of a specific log entry by RayID. Searches through ALL log files in the specified bucket to find the matching entry (stops as soon as found).",
 			{
 				bucket: z
 					.enum(["http", "waf"])
@@ -572,16 +646,25 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 			},
 			async ({ bucket, prefix, ray_id }) => {
 				const r2Bucket = bucket === "http" ? this.env.HTTP_LOG_BUCKET : this.env.WAF_LOG_BUCKET;
-				let logs = await readLogsFromR2(r2Bucket, prefix);
+				let entry: Record<string, any> | undefined;
 
-				let entry = logs.find((log) => log.RayID === ray_id);
+				const { totalEntries, filesProcessed } = await forEachLogInR2(
+					r2Bucket,
+					prefix,
+					(log) => {
+						if (log.RayID === ray_id) {
+							entry = log;
+							return false; // stop iteration
+						}
+					},
+				);
 
 				if (!entry) {
 					return {
 						content: [
 							{
 								type: "text" as const,
-								text: `No log entry found with RayID "${ray_id}" under prefix "${prefix}". Searched ${logs.length} entries.`,
+								text: `No log entry found with RayID "${ray_id}" under prefix "${prefix}". Searched ${totalEntries} entries across ${filesProcessed} files.`,
 							},
 						],
 					};
@@ -597,7 +680,7 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					content: [
 						{
 							type: "text" as const,
-							text: `Log entry for RayID ${ray_id}:\n${JSON.stringify(entry, null, 2)}`,
+							text: `Log entry for RayID ${ray_id} (found after scanning ${filesProcessed} files):\n${JSON.stringify(entry, null, 2)}`,
 						},
 					],
 				};
