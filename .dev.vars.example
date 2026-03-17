@@ -1,0 +1,7 @@
+ACCESS_CLIENT_ID=<your client id>
+ACCESS_CLIENT_SECRET=<your client secret>
+ACCESS_TOKEN_URL=<your Access for SaaS token url>
+ACCESS_AUTHORIZATION_URL=<your Access for SaaS authorization url>
+ACCESS_JWKS_URL=<your Access for SaaS JWKS url>
+COOKIE_ENCRYPTION_KEY=<random string e.g. openssl rand -hex 32>
+MATCHED_PAYLOAD_PRIVATE_KEY=<optional: base64-encoded private key for WAF payload decryption>
