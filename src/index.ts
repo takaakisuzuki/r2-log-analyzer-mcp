@@ -78,50 +78,105 @@ function matchesFilters(
 }
 
 /**
- * Iterate ALL R2 objects under a prefix with cursor-based pagination.
+ * Convert a local date (YYYY-MM-DD) + timezone offset (hours) to a UTC time range
+ * and the UTC date directory prefixes needed to cover that range.
+ *
+ * Example: date="2026-03-15", tzOffset=9 (JST)
+ *   → UTC range: 2026-03-14T15:00:00Z ~ 2026-03-15T15:00:00Z
+ *   → UTC date dirs: ["20260314/", "20260315/"]
+ */
+function localDateToUTCRange(
+	date: string,
+	tzOffset: number,
+	basePrefix: string = "",
+): { utcStart: string; utcEnd: string; prefixes: string[] } {
+	const [year, month, day] = date.split("-").map(Number);
+	// Local midnight → UTC
+	const utcStart = new Date(Date.UTC(year, month - 1, day, -tzOffset, 0, 0));
+	const utcEnd = new Date(utcStart.getTime() + 24 * 60 * 60 * 1000);
+
+	// Collect all UTC dates that fall within the range
+	const utcDates = new Set<string>();
+	const cursor = new Date(utcStart);
+	while (cursor < utcEnd) {
+		const y = cursor.getUTCFullYear();
+		const m = String(cursor.getUTCMonth() + 1).padStart(2, "0");
+		const d = String(cursor.getUTCDate()).padStart(2, "0");
+		utcDates.add(`${y}${m}${d}`);
+		cursor.setUTCDate(cursor.getUTCDate() + 1);
+	}
+
+	const prefixes = Array.from(utcDates).map(
+		(d) => (basePrefix ? `${basePrefix}${d}/` : `${d}/`),
+	);
+
+	return {
+		utcStart: utcStart.toISOString(),
+		utcEnd: utcEnd.toISOString(),
+		prefixes,
+	};
+}
+
+/**
+ * Iterate ALL R2 objects under one or more prefixes with cursor-based pagination.
  * Processes each file one at a time to avoid holding all logs in memory.
  * Return `false` from callback to stop early (e.g. when a specific entry is found).
+ * When timeRange is specified, only entries whose Datetime/EdgeStartTimestamp falls
+ * within [start, end) are passed to the callback.
  */
 async function forEachLogInR2(
 	bucket: R2Bucket,
-	prefix: string,
+	prefixes: string | string[],
 	callback: (log: Record<string, any>) => boolean | void,
-): Promise<{ totalEntries: number; filesProcessed: number }> {
-	let cursor: string | undefined;
+	timeRange?: { start: string; end: string },
+): Promise<{ totalEntries: number; filesProcessed: number; filteredEntries: number }> {
+	const prefixList = Array.isArray(prefixes) ? prefixes : [prefixes];
 	let filesProcessed = 0;
 	let totalEntries = 0;
+	let filteredEntries = 0;
 	let stopped = false;
 
-	do {
-		const listed = await bucket.list({
-			prefix,
-			limit: 100,
-			cursor,
-		});
+	for (const prefix of prefixList) {
+		if (stopped) break;
+		let cursor: string | undefined;
 
-		for (const obj of listed.objects) {
-			if (stopped) break;
-			const r2Obj = await bucket.get(obj.key);
-			if (!r2Obj) continue;
+		do {
+			const listed = await bucket.list({
+				prefix,
+				limit: 100,
+				cursor,
+			});
 
-			const text = await readR2ObjectText(r2Obj, obj.key);
-			const logs = parseLogLines(text);
-			filesProcessed++;
+			for (const obj of listed.objects) {
+				if (stopped) break;
+				const r2Obj = await bucket.get(obj.key);
+				if (!r2Obj) continue;
 
-			for (const log of logs) {
-				totalEntries++;
-				const result = callback(log);
-				if (result === false) {
-					stopped = true;
-					break;
+				const text = await readR2ObjectText(r2Obj, obj.key);
+				const logs = parseLogLines(text);
+				filesProcessed++;
+
+				for (const log of logs) {
+					totalEntries++;
+					// Apply time range filter if specified
+					if (timeRange) {
+						const dt = log.Datetime || log.EdgeStartTimestamp;
+						if (dt && (dt < timeRange.start || dt >= timeRange.end)) continue;
+					}
+					filteredEntries++;
+					const result = callback(log);
+					if (result === false) {
+						stopped = true;
+						break;
+					}
 				}
 			}
-		}
 
-		cursor = listed.truncated ? listed.cursor : undefined;
-	} while (cursor && !stopped);
+			cursor = listed.truncated ? listed.cursor : undefined;
+		} while (cursor && !stopped);
+	}
 
-	return { totalEntries, filesProcessed };
+	return { totalEntries, filesProcessed, filteredEntries };
 }
 
 /**
@@ -261,12 +316,33 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"query_http_logs",
-			"Query and filter HTTP request logs stored in R2. Scans ALL log files under the prefix (no sampling). Returns matching log entries from Cloudflare Logpush http_requests dataset. Key fields include: ClientIP, ClientCountry, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestURI, ClientRequestUserAgent, EdgeResponseStatus, EdgeColoCode, OriginResponseStatus, RayID, SecurityAction, BotScore, CacheCacheStatus, EdgeStartTimestamp, etc.",
+			"Query and filter HTTP request logs stored in R2. Scans ALL log files (no sampling). Supports timezone-aware date queries: specify 'date' + 'timezone_offset' to auto-generate correct UTC prefixes and filter by exact time range. Key fields: ClientIP, ClientCountry, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestURI, ClientRequestUserAgent, EdgeResponseStatus, EdgeColoCode, OriginResponseStatus, RayID, SecurityAction, BotScore, CacheCacheStatus, EdgeStartTimestamp, etc.",
 			{
 				prefix: z
 					.string()
+					.optional()
 					.describe(
-						"R2 key prefix for the HTTP log files, e.g. 'http_requests/2025-03-15' or 'http_requests/'.",
+						"R2 key prefix for the HTTP log files, e.g. 'http_requests/20250315/'. Required unless 'date' is specified.",
+					),
+				date: z
+					.string()
+					.optional()
+					.describe(
+						"Local date to query (YYYY-MM-DD). Auto-generates UTC prefixes and filters by exact time range. Use with timezone_offset.",
+					),
+				timezone_offset: z
+					.number()
+					.optional()
+					.default(0)
+					.describe(
+						"UTC offset in hours for the 'date' parameter (e.g. 9 for JST, -5 for EST). Defaults to 0 (UTC).",
+					),
+				base_prefix: z
+					.string()
+					.optional()
+					.default("")
+					.describe(
+						"Base R2 prefix prepended to auto-generated date prefixes when using 'date' mode (e.g. 'http_requests/').",
 					),
 				filters: z
 					.record(z.union([z.string(), z.number(), z.boolean()]))
@@ -287,7 +363,25 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					.default(50)
 					.describe("Maximum number of matching log entries to return."),
 			},
-			async ({ prefix, filters, fields, max_results }) => {
+			async ({ prefix, date, timezone_offset, base_prefix, filters, fields, max_results }) => {
+				// Resolve prefixes and optional time range
+				let scanPrefixes: string | string[];
+				let timeRange: { start: string; end: string } | undefined;
+				let dateInfo = "";
+
+				if (date) {
+					const resolved = localDateToUTCRange(date, timezone_offset ?? 0, base_prefix ?? "");
+					scanPrefixes = resolved.prefixes;
+					timeRange = { start: resolved.utcStart, end: resolved.utcEnd };
+					dateInfo = `Local date: ${date} (UTC${timezone_offset && timezone_offset >= 0 ? "+" : ""}${timezone_offset ?? 0}) → UTC range: ${resolved.utcStart} ~ ${resolved.utcEnd}\nScanning prefixes: ${resolved.prefixes.join(", ")}`;
+				} else if (prefix) {
+					scanPrefixes = prefix;
+				} else {
+					return {
+						content: [{ type: "text" as const, text: "Either 'prefix' or 'date' must be specified." }],
+					};
+				}
+
 				const defaultFields = [
 					"EdgeStartTimestamp",
 					"ClientIP",
@@ -305,9 +399,9 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 				const results: Record<string, any>[] = [];
 				let totalMatched = 0;
 
-				const { totalEntries, filesProcessed } = await forEachLogInR2(
+				const { totalEntries, filesProcessed, filteredEntries } = await forEachLogInR2(
 					this.env.HTTP_LOG_BUCKET,
-					prefix,
+					scanPrefixes,
 					(log) => {
 						if (!filters || matchesFilters(log, filters)) {
 							totalMatched++;
@@ -320,23 +414,26 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 							}
 						}
 					},
+					timeRange,
 				);
 
 				if (totalEntries === 0) {
 					return {
-						content: [{ type: "text" as const, text: `No HTTP logs found under prefix "${prefix}".` }],
+						content: [{ type: "text" as const, text: `No HTTP logs found.${dateInfo ? "\n" + dateInfo : ""}` }],
 					};
 				}
 
 				const summary = [
-					`HTTP Logs Query Results (prefix: "${prefix}")`,
+					`HTTP Logs Query Results`,
+					dateInfo || `Prefix: "${prefix}"`,
 					`Files processed: ${filesProcessed}`,
 					`Total logs scanned: ${totalEntries}`,
-					`Matched: ${totalMatched}`,
+					timeRange ? `In time range: ${filteredEntries}` : "",
+					`Matched (after filters): ${totalMatched}`,
 					`Returned: ${results.length}`,
 					filters ? `Filters: ${JSON.stringify(filters)}` : "No filters applied",
 					"---",
-				].join("\n");
+				].filter(Boolean).join("\n");
 
 				return {
 					content: [
@@ -354,12 +451,33 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"query_firewall_logs",
-			"Query and filter WAF/firewall event logs stored in R2. Scans ALL log files under the prefix (no sampling). Returns matching log entries from Cloudflare Logpush firewall_events dataset. Key fields include: Action, ClientIP, ClientCountry, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestUserAgent, Datetime, Description, EdgeColoCode, EdgeResponseStatus, RayID, RuleID, Source, Kind, MatchIndex, Metadata, etc.",
+			"Query and filter WAF/firewall event logs stored in R2. Scans ALL log files (no sampling). Supports timezone-aware date queries: specify 'date' + 'timezone_offset' to auto-generate correct UTC prefixes and filter by exact time range. Key fields: Action, ClientIP, ClientCountry, ClientRequestHost, ClientRequestMethod, ClientRequestPath, ClientRequestUserAgent, Datetime, Description, EdgeColoCode, EdgeResponseStatus, RayID, RuleID, Source, Kind, MatchIndex, Metadata, etc.",
 			{
 				prefix: z
 					.string()
+					.optional()
 					.describe(
-						"R2 key prefix for the firewall log files, e.g. 'firewall_events/2025-03-15' or 'firewall_events/'.",
+						"R2 key prefix for the firewall log files, e.g. 'firewall_events/20250315/'. Required unless 'date' is specified.",
+					),
+				date: z
+					.string()
+					.optional()
+					.describe(
+						"Local date to query (YYYY-MM-DD). Auto-generates UTC prefixes and filters by exact time range. Use with timezone_offset.",
+					),
+				timezone_offset: z
+					.number()
+					.optional()
+					.default(0)
+					.describe(
+						"UTC offset in hours for the 'date' parameter (e.g. 9 for JST, -5 for EST). Defaults to 0 (UTC).",
+					),
+				base_prefix: z
+					.string()
+					.optional()
+					.default("")
+					.describe(
+						"Base R2 prefix prepended to auto-generated date prefixes when using 'date' mode (e.g. 'firewall_events/').",
 					),
 				filters: z
 					.record(z.union([z.string(), z.number(), z.boolean()]))
@@ -380,7 +498,24 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					.default(50)
 					.describe("Maximum number of matching log entries to return."),
 			},
-			async ({ prefix, filters, fields, max_results }) => {
+			async ({ prefix, date, timezone_offset, base_prefix, filters, fields, max_results }) => {
+				let scanPrefixes: string | string[];
+				let timeRange: { start: string; end: string } | undefined;
+				let dateInfo = "";
+
+				if (date) {
+					const resolved = localDateToUTCRange(date, timezone_offset ?? 0, base_prefix ?? "");
+					scanPrefixes = resolved.prefixes;
+					timeRange = { start: resolved.utcStart, end: resolved.utcEnd };
+					dateInfo = `Local date: ${date} (UTC${timezone_offset && timezone_offset >= 0 ? "+" : ""}${timezone_offset ?? 0}) → UTC range: ${resolved.utcStart} ~ ${resolved.utcEnd}\nScanning prefixes: ${resolved.prefixes.join(", ")}`;
+				} else if (prefix) {
+					scanPrefixes = prefix;
+				} else {
+					return {
+						content: [{ type: "text" as const, text: "Either 'prefix' or 'date' must be specified." }],
+					};
+				}
+
 				const defaultFields = [
 					"Datetime",
 					"Action",
@@ -402,9 +537,9 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 				let totalMatched = 0;
 				const privateKey = this.env.MATCHED_PAYLOAD_PRIVATE_KEY;
 
-				const { totalEntries, filesProcessed } = await forEachLogInR2(
+				const { totalEntries, filesProcessed, filteredEntries } = await forEachLogInR2(
 					this.env.WAF_LOG_BUCKET,
-					prefix,
+					scanPrefixes,
 					(log) => {
 						if (!filters || matchesFilters(log, filters)) {
 							totalMatched++;
@@ -413,12 +548,13 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 							}
 						}
 					},
+					timeRange,
 				);
 
 				if (totalEntries === 0) {
 					return {
 						content: [
-							{ type: "text" as const, text: `No firewall logs found under prefix "${prefix}".` },
+							{ type: "text" as const, text: `No firewall logs found.${dateInfo ? "\n" + dateInfo : ""}` },
 						],
 					};
 				}
@@ -435,14 +571,16 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 				});
 
 				const summary = [
-					`Firewall Events Query Results (prefix: "${prefix}")`,
+					`Firewall Events Query Results`,
+					dateInfo || `Prefix: "${prefix}"`,
 					`Files processed: ${filesProcessed}`,
 					`Total logs scanned: ${totalEntries}`,
-					`Matched: ${totalMatched}`,
+					timeRange ? `In time range: ${filteredEntries}` : "",
+					`Matched (after filters): ${totalMatched}`,
 					`Returned: ${entries.length}`,
 					filters ? `Filters: ${JSON.stringify(filters)}` : "No filters applied",
 					"---",
-				].join("\n");
+				].filter(Boolean).join("\n");
 
 				return {
 					content: [
@@ -460,11 +598,26 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"analyze_http_traffic",
-			"Analyze HTTP request logs to generate traffic summaries. Scans ALL log files under the prefix (no sampling). Provides top-N rankings for IPs, countries, paths, status codes, user agents, cache status, and more.",
+			"Analyze HTTP request logs to generate traffic summaries. Scans ALL log files (no sampling). Supports timezone-aware date queries: specify 'date' + 'timezone_offset' to auto-generate correct UTC prefixes and filter by exact time range. Provides top-N rankings for IPs, countries, paths, status codes, user agents, cache status, and more.",
 			{
 				prefix: z
 					.string()
-					.describe("R2 key prefix for the HTTP log files, e.g. 'http_requests/2025-03-15'."),
+					.optional()
+					.describe("R2 key prefix for the HTTP log files, e.g. 'http_requests/20250315/'. Required unless 'date' is specified."),
+				date: z
+					.string()
+					.optional()
+					.describe("Local date to analyze (YYYY-MM-DD). Auto-generates UTC prefixes and filters by exact time range."),
+				timezone_offset: z
+					.number()
+					.optional()
+					.default(0)
+					.describe("UTC offset in hours (e.g. 9 for JST, -5 for EST). Defaults to 0 (UTC)."),
+				base_prefix: z
+					.string()
+					.optional()
+					.default("")
+					.describe("Base R2 prefix prepended to auto-generated date prefixes when using 'date' mode."),
 				top_n: z
 					.number()
 					.min(1)
@@ -476,7 +629,24 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					.optional()
 					.describe("Optional pre-filters to apply before analysis."),
 			},
-			async ({ prefix, top_n, filters }) => {
+			async ({ prefix, date, timezone_offset, base_prefix, top_n, filters }) => {
+				let scanPrefixes: string | string[];
+				let timeRange: { start: string; end: string } | undefined;
+				let dateInfo = "";
+
+				if (date) {
+					const resolved = localDateToUTCRange(date, timezone_offset ?? 0, base_prefix ?? "");
+					scanPrefixes = resolved.prefixes;
+					timeRange = { start: resolved.utcStart, end: resolved.utcEnd };
+					dateInfo = `Local date: ${date} (UTC${timezone_offset && timezone_offset >= 0 ? "+" : ""}${timezone_offset ?? 0}) → UTC range: ${resolved.utcStart} ~ ${resolved.utcEnd}\nScanning prefixes: ${resolved.prefixes.join(", ")}`;
+				} else if (prefix) {
+					scanPrefixes = prefix;
+				} else {
+					return {
+						content: [{ type: "text" as const, text: "Either 'prefix' or 'date' must be specified." }],
+					};
+				}
+
 				const analysisFields = [
 					"ClientIP", "ClientCountry", "ClientRequestHost",
 					"ClientRequestPath", "ClientRequestMethod",
@@ -486,26 +656,29 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 				];
 				const agg = new StreamingAggregator();
 
-				const { totalEntries, filesProcessed } = await forEachLogInR2(
+				const { totalEntries, filesProcessed, filteredEntries } = await forEachLogInR2(
 					this.env.HTTP_LOG_BUCKET,
-					prefix,
+					scanPrefixes,
 					(log) => {
 						if (!filters || matchesFilters(log, filters)) {
 							agg.add(log, analysisFields);
 						}
 					},
+					timeRange,
 				);
 
 				if (totalEntries === 0) {
 					return {
-						content: [{ type: "text" as const, text: `No HTTP logs found under prefix "${prefix}".` }],
+						content: [{ type: "text" as const, text: `No HTTP logs found.${dateInfo ? "\n" + dateInfo : ""}` }],
 					};
 				}
 
 				const analyses = [
-					`HTTP Traffic Analysis (prefix: "${prefix}")`,
+					`HTTP Traffic Analysis`,
+					dateInfo || `Prefix: "${prefix}"`,
 					`Files processed: ${filesProcessed}`,
 					`Total logs scanned: ${totalEntries}`,
+					timeRange ? `In time range: ${filteredEntries}` : "",
 					`Total logs analyzed (after filters): ${agg.total}`,
 					filters ? `Pre-filters: ${JSON.stringify(filters)}` : "",
 					"===",
@@ -546,11 +719,26 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 		// ---------------------------------------------------------------
 		this.server.tool(
 			"analyze_waf_events",
-			"Analyze WAF/firewall event logs to generate security summaries. Scans ALL log files under the prefix (no sampling). Provides top-N rankings for blocked IPs, actions, rules, sources, countries, and targeted paths.",
+			"Analyze WAF/firewall event logs to generate security summaries. Scans ALL log files (no sampling). Supports timezone-aware date queries: specify 'date' + 'timezone_offset' to auto-generate correct UTC prefixes and filter by exact time range. Provides top-N rankings for blocked IPs, actions, rules, sources, countries, and targeted paths.",
 			{
 				prefix: z
 					.string()
-					.describe("R2 key prefix for the firewall log files, e.g. 'firewall_events/2025-03-15'."),
+					.optional()
+					.describe("R2 key prefix for the firewall log files, e.g. 'firewall_events/20250315/'. Required unless 'date' is specified."),
+				date: z
+					.string()
+					.optional()
+					.describe("Local date to analyze (YYYY-MM-DD). Auto-generates UTC prefixes and filters by exact time range."),
+				timezone_offset: z
+					.number()
+					.optional()
+					.default(0)
+					.describe("UTC offset in hours (e.g. 9 for JST, -5 for EST). Defaults to 0 (UTC)."),
+				base_prefix: z
+					.string()
+					.optional()
+					.default("")
+					.describe("Base R2 prefix prepended to auto-generated date prefixes when using 'date' mode."),
 				top_n: z
 					.number()
 					.min(1)
@@ -562,7 +750,24 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 					.optional()
 					.describe("Optional pre-filters to apply before analysis."),
 			},
-			async ({ prefix, top_n, filters }) => {
+			async ({ prefix, date, timezone_offset, base_prefix, top_n, filters }) => {
+				let scanPrefixes: string | string[];
+				let timeRange: { start: string; end: string } | undefined;
+				let dateInfo = "";
+
+				if (date) {
+					const resolved = localDateToUTCRange(date, timezone_offset ?? 0, base_prefix ?? "");
+					scanPrefixes = resolved.prefixes;
+					timeRange = { start: resolved.utcStart, end: resolved.utcEnd };
+					dateInfo = `Local date: ${date} (UTC${timezone_offset && timezone_offset >= 0 ? "+" : ""}${timezone_offset ?? 0}) → UTC range: ${resolved.utcStart} ~ ${resolved.utcEnd}\nScanning prefixes: ${resolved.prefixes.join(", ")}`;
+				} else if (prefix) {
+					scanPrefixes = prefix;
+				} else {
+					return {
+						content: [{ type: "text" as const, text: "Either 'prefix' or 'date' must be specified." }],
+					};
+				}
+
 				const analysisFields = [
 					"Action", "Source", "ClientIP", "ClientCountry",
 					"ClientRequestHost", "ClientRequestPath",
@@ -571,28 +776,31 @@ export class R2LogAnalyzerMCP extends McpAgent<Env, Record<string, never>, Props
 				];
 				const agg = new StreamingAggregator();
 
-				const { totalEntries, filesProcessed } = await forEachLogInR2(
+				const { totalEntries, filesProcessed, filteredEntries } = await forEachLogInR2(
 					this.env.WAF_LOG_BUCKET,
-					prefix,
+					scanPrefixes,
 					(log) => {
 						if (!filters || matchesFilters(log, filters)) {
 							agg.add(log, analysisFields);
 						}
 					},
+					timeRange,
 				);
 
 				if (totalEntries === 0) {
 					return {
 						content: [
-							{ type: "text" as const, text: `No firewall logs found under prefix "${prefix}".` },
+							{ type: "text" as const, text: `No firewall logs found.${dateInfo ? "\n" + dateInfo : ""}` },
 						],
 					};
 				}
 
 				const analyses = [
-					`WAF/Firewall Events Analysis (prefix: "${prefix}")`,
+					`WAF/Firewall Events Analysis`,
+					dateInfo || `Prefix: "${prefix}"`,
 					`Files processed: ${filesProcessed}`,
 					`Total events scanned: ${totalEntries}`,
+					timeRange ? `In time range: ${filteredEntries}` : "",
 					`Total events analyzed (after filters): ${agg.total}`,
 					filters ? `Pre-filters: ${JSON.stringify(filters)}` : "",
 					"===",
