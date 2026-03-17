@@ -118,12 +118,21 @@ function localDateToUTCRange(
 }
 
 /**
- * Iterate ALL R2 objects under one or more prefixes with cursor-based pagination.
- * Processes each file one at a time to avoid holding all logs in memory.
- * Return `false` from callback to stop early (e.g. when a specific entry is found).
- * When timeRange is specified, only entries whose Datetime/EdgeStartTimestamp falls
- * within [start, end) are passed to the callback.
+ * Parse a timestamp value (ISO string or numeric unix seconds/ms/ns) to epoch milliseconds.
+ * Returns NaN if unparseable.
  */
+function toEpochMs(dt: unknown): number {
+	if (typeof dt === "number") {
+		if (dt > 1e15) return dt / 1e6;   // nanoseconds → ms
+		if (dt > 1e12) return dt;          // already ms
+		return dt * 1000;                  // seconds → ms
+	}
+	if (typeof dt === "string") {
+		return new Date(dt).getTime();
+	}
+	return NaN;
+}
+
 async function forEachLogInR2(
 	bucket: R2Bucket,
 	prefixes: string | string[],
@@ -135,6 +144,10 @@ async function forEachLogInR2(
 	let totalEntries = 0;
 	let filteredEntries = 0;
 	let stopped = false;
+
+	// Pre-compute numeric timestamps for reliable comparison
+	const startMs = timeRange ? new Date(timeRange.start).getTime() : 0;
+	const endMs = timeRange ? new Date(timeRange.end).getTime() : 0;
 
 	for (const prefix of prefixList) {
 		if (stopped) break;
@@ -161,7 +174,9 @@ async function forEachLogInR2(
 					// Apply time range filter if specified
 					if (timeRange) {
 						const dt = log.Datetime || log.EdgeStartTimestamp;
-						if (dt && (dt < timeRange.start || dt >= timeRange.end)) continue;
+						if (!dt) continue; // No timestamp → skip when filtering by time
+						const ts = toEpochMs(dt);
+						if (isNaN(ts) || ts < startMs || ts >= endMs) continue;
 					}
 					filteredEntries++;
 					const result = callback(log);
