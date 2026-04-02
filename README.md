@@ -1,23 +1,23 @@
 # R2 Log Analyzer MCP Server
 
-Cloudflare R2に保存されたHTTPリクエストログおよびWAF/ファイアウォールイベントログを、Claude DesktopなどのMCPクライアントから自然言語で分析できるリモートMCPサーバーです。
+A remote MCP server that lets you analyze HTTP request logs and WAF/Firewall event logs stored in Cloudflare R2 using natural language via MCP clients such as Claude Desktop.
 
-Cloudflare Workers上で動作し、Cloudflare Access OAuthによる認証、gzip圧縮ログの自動展開、WAFペイロードロギング（`encrypted_matched_data`）の復号化に対応しています。
+Runs on Cloudflare Workers with Cloudflare Access OAuth authentication, automatic gzip log decompression, and WAF Payload Logging (`encrypted_matched_data`) decryption.
 
-## 特徴
+## Features
 
-- **自然言語でのログ分析** — 「昨日のWAFブロックを分析して」のようにMCPクライアントに問い合わせるだけ
-- **Cloudflare Access OAuth認証** — PKCE対応のOAuth 2.1フローでセキュアなアクセス制御
-- **gzip自動展開** — Logpushが出力する `.log.gz` ファイルを透過的に展開
-- **WAFペイロード復号化** — Cloudflare WAF Payload Loggingの暗号化ペイロード（HPKE: X25519 + ChaCha20-Poly1305）を自動復号
-- **Durable Objects** — MCPプロトコルのステート管理にCloudflare Durable Objectsを使用
+- **Natural language log analysis** — Simply ask your MCP client something like "Analyze today's WAF blocks"
+- **Cloudflare Access OAuth** — Secure access control via OAuth 2.1 with PKCE
+- **Automatic gzip decompression** — Transparently decompresses `.log.gz` files output by Logpush
+- **WAF payload decryption** — Automatically decrypts Cloudflare WAF Payload Logging encrypted payloads (HPKE: X25519 + ChaCha20-Poly1305)
+- **Durable Objects** — Uses Cloudflare Durable Objects for MCP protocol state management
 
-## アーキテクチャ
+## Architecture
 
 ```
 ┌──────────────┐     OAuth 2.1 + PKCE     ┌─────────────────────────┐
 │ MCP Client   │◄────────────────────────►│ Cloudflare Access       │
-│ (Claude等)   │                          │ (OIDC IdP)              │
+│ (Claude etc) │                          │ (OIDC IdP)              │
 └──────┬───────┘                          └─────────────────────────┘
        │ MCP Protocol (SSE)
        ▼
@@ -38,48 +38,48 @@ Cloudflare Workers上で動作し、Cloudflare Access OAuthによる認証、gzi
 └──────────────────────────────┘     └──────────────────┘
 ```
 
-## 提供ツール
+## Available Tools
 
-| ツール名 | 説明 |
+| Tool | Description |
 |---|---|
-| `list_log_files` | R2バケット内のログファイル一覧を取得 |
-| `query_http_logs` | HTTPリクエストログの検索・フィルタリング |
-| `query_firewall_logs` | WAFファイアウォールイベントログの検索・フィルタリング（ペイロード自動復号付き） |
-| `analyze_http_traffic` | HTTPトラフィックのTop-N分析（IP、国、パス、ステータスコード等） |
-| `analyze_waf_events` | WAFイベントのTop-N分析（アクション、ルール、ソース、攻撃元IP等） |
-| `get_log_entry` | RayIDによる特定ログエントリの詳細取得 |
-| `read_raw_log_file` | R2上の生ログファイルの直接読み取り |
-| `decrypt_waf_payload` | WAF暗号化ペイロード（`encrypted_matched_data`）の個別復号化 |
+| `list_log_files` | List log files in an R2 bucket |
+| `query_http_logs` | Search and filter HTTP request logs |
+| `query_firewall_logs` | Search and filter WAF firewall event logs (with automatic payload decryption) |
+| `analyze_http_traffic` | Top-N analysis of HTTP traffic (by IP, country, path, status code, etc.) |
+| `analyze_waf_events` | Top-N analysis of WAF events (by action, rule, source, attacker IP, etc.) |
+| `get_log_entry` | Retrieve details of a specific log entry by RayID |
+| `read_raw_log_file` | Read a raw log file directly from R2 |
+| `decrypt_waf_payload` | Decrypt an individual WAF encrypted payload (`encrypted_matched_data`) |
 
-## 前提条件
+## Prerequisites
 
-- Cloudflareアカウント（Workers, R2, KV, Durable Objects, Access）
-- [Logpush](https://developers.cloudflare.com/logs/logpush/) でR2バケットへのログ出力が設定済みであること
-  - [HTTP requests](https://developers.cloudflare.com/logs/reference/log-fields/zone/http_requests/) データセット
-  - [Firewall events](https://developers.cloudflare.com/logs/reference/log-fields/zone/firewall_events/) データセット
-- [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) のOIDCアプリケーション設定
+- A Cloudflare account (Workers, R2, KV, Durable Objects, Access)
+- [Logpush](https://developers.cloudflare.com/logs/logpush/) configured to output logs to R2 buckets
+  - [HTTP requests](https://developers.cloudflare.com/logs/reference/log-fields/zone/http_requests/) dataset
+  - [Firewall events](https://developers.cloudflare.com/logs/reference/log-fields/zone/firewall_events/) dataset
+- A [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) OIDC application
 
-## セットアップ
+## Setup
 
-### 1. リポジトリのクローンと依存関係のインストール
+### 1. Clone the Repository and Install Dependencies
 
 ```bash
-git clone https://github.com/<your-org>/r2-log-analyzer-mcp.git
+git clone https://github.com/takaakisuzuki/r2-log-analyzer-mcp.git
 cd r2-log-analyzer-mcp
 npm install
 ```
 
-### 2. KVネームスペースの作成
+### 2. Create a KV Namespace
 
 ```bash
 npx wrangler kv:namespace create "OAUTH_KV"
 ```
 
-出力されたIDを `wrangler.jsonc` の `kv_namespaces[0].id` に設定してください。
+Set the output ID in `kv_namespaces[0].id` in `wrangler.jsonc`.
 
-### 3. R2バケット名の設定
+### 3. Configure R2 Bucket Names
 
-`wrangler.jsonc` の `r2_buckets` に、Logpushの出力先R2バケット名を設定してください。
+Set your Logpush destination R2 bucket names in the `r2_buckets` section of `wrangler.jsonc`.
 
 ```jsonc
 "r2_buckets": [
@@ -94,26 +94,26 @@ npx wrangler kv:namespace create "OAUTH_KV"
 ]
 ```
 
-> **Note**: Logpushのデータセットごとに別バケットが作成される場合があります。Cloudflare Dashboard > Analytics & Logs > Logpush で確認してください。
+> **Note**: Separate buckets may be created for each Logpush dataset. Verify in Cloudflare Dashboard > Analytics & Logs > Logpush.
 
-### 4. Cloudflare Access OIDCアプリの作成
+### 4. Create a Cloudflare Access OIDC Application
 
-[Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) > Access > Applications から **SaaS Application** を作成します。
+Go to [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) > Access > Applications and create a **SaaS Application**.
 
 1. Application type: **OIDC**
 2. **Scopes**: `openid`, `email`, `profile`
 3. **Redirect URLs**:
-   - 本番: `https://r2-log-analyzer-mcp.<your-subdomain>.workers.dev/callback`
-   - ローカル開発: `http://localhost:8788/callback`
+   - Production: `https://r2-log-analyzer-mcp.<your-subdomain>.workers.dev/callback`
+   - Local development: `http://localhost:8788/callback`
 
-作成後に表示される以下の情報を控えてください:
+Note the following values after creation:
 - Client ID
 - Client Secret
 - Authorization URL
 - Token URL
 - JWKS URL (Certificate URL)
 
-### 5. シークレットの設定
+### 5. Set Secrets
 
 ```bash
 npx wrangler secret put ACCESS_CLIENT_ID
@@ -121,43 +121,43 @@ npx wrangler secret put ACCESS_CLIENT_SECRET
 npx wrangler secret put ACCESS_TOKEN_URL
 npx wrangler secret put ACCESS_AUTHORIZATION_URL
 npx wrangler secret put ACCESS_JWKS_URL
-npx wrangler secret put COOKIE_ENCRYPTION_KEY  # openssl rand -hex 32 で生成
+npx wrangler secret put COOKIE_ENCRYPTION_KEY  # Generate with: openssl rand -hex 32
 ```
 
-### 6. デプロイ
+### 6. Deploy
 
 ```bash
 npm run deploy
 ```
 
-### 7. WAFペイロード復号化の設定（オプション）
+### 7. Configure WAF Payload Decryption (Optional)
 
-[WAF Payload Logging](https://developers.cloudflare.com/waf/managed-rules/payload-logging/) を有効化すると、WAFルールにマッチしたリクエストボディの内容を暗号化してログに記録できます。
+Enable [WAF Payload Logging](https://developers.cloudflare.com/waf/managed-rules/payload-logging/) to encrypt and log the content of request bodies that match WAF rules.
 
-#### 鍵ペアの生成
+#### Generate a Key Pair
 
-Cloudflare Dashboard > Security > WAF > Managed rules > 該当ルールセット > **Configure payload logging** で鍵ペアを生成するか、[matched-data-cli](https://github.com/cloudflare/matched-data-cli) を使用します。
+Generate a key pair via Cloudflare Dashboard > Security > WAF > Managed rules > target ruleset > **Configure payload logging**, or use [matched-data-cli](https://github.com/cloudflare/matched-data-cli):
 
 ```bash
 cargo install matched-data-cli
 matched-data-cli generate-key-pair
 ```
 
-#### 秘密鍵の設定
+#### Set the Private Key
 
 ```bash
 npx wrangler secret put MATCHED_PAYLOAD_PRIVATE_KEY
-# 生成された秘密鍵（base64エンコード）を入力
+# Enter the generated private key (base64-encoded)
 ```
 
-公開鍵はCloudflare Dashboard の Managed Ruleset のペイロードロギング設定に登録してください。
+Register the public key in the Managed Ruleset payload logging settings in the Cloudflare Dashboard.
 
-設定後、WAFルールがリクエストボディの内容にマッチした際に `Metadata.encrypted_matched_data` がログに記録され、本MCPサーバーが自動的に復号化します。
+Once configured, `Metadata.encrypted_matched_data` will be recorded in logs when a WAF rule matches request body content, and this MCP server will automatically decrypt it.
 
-## ローカル開発
+## Local Development
 
 ```bash
-# .dev.vars にシークレットを設定
+# Set secrets in .dev.vars
 cat > .dev.vars << 'EOF'
 ACCESS_CLIENT_ID=<your-client-id>
 ACCESS_CLIENT_SECRET=<your-client-secret>
@@ -168,22 +168,22 @@ COOKIE_ENCRYPTION_KEY=<random-hex-string>
 MATCHED_PAYLOAD_PRIVATE_KEY=<optional-private-key>
 EOF
 
-# 開発サーバーの起動
+# Start the development server
 npm run dev
 ```
 
-[MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector) で接続テスト:
+Test the connection with [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector):
 
 ```bash
 npx @modelcontextprotocol/inspector@latest
 # URL: http://localhost:8788/sse
 ```
 
-## MCPクライアントからの接続
+## Connecting from MCP Clients
 
 ### Claude Desktop
 
-`Settings > Developer > Edit Config` で以下を設定:
+Go to `Settings > Developer > Edit Config` and add the following:
 
 ```json
 {
@@ -199,97 +199,97 @@ npx @modelcontextprotocol/inspector@latest
 }
 ```
 
-初回接続時にブラウザが開き、Cloudflare Accessの認証画面が表示されます。
+On the first connection, a browser window will open showing the Cloudflare Access authentication screen.
 
 ### Windsurf / Cursor
 
-Type: `command`、Command:
+Type: `command`, Command:
 
 ```
 npx mcp-remote https://r2-log-analyzer-mcp.<your-subdomain>.workers.dev/sse
 ```
 
-## 使用例
+## Usage Examples
 
-MCPクライアント（Claude Desktop等）で以下のように問い合わせられます:
-
-```
-WAFファイアウォールイベントの今日のログを分析して
-```
+You can query your MCP client (e.g., Claude Desktop) like this:
 
 ```
-昨日のHTTPトラフィックでステータス403が多いIPを教えて
+Analyze today's WAF firewall event logs
 ```
 
 ```
-RayID 9dd222669c879d35 の詳細を見せて
+Show me the IPs with the most 403 status codes in yesterday's HTTP traffic
 ```
 
 ```
-今週のWAFブロックで最も多い攻撃パターンは？
+Show details for RayID 9dd222669c879d35
 ```
 
-## プロジェクト構成
+```
+What are the most common attack patterns in this week's WAF blocks?
+```
+
+## Project Structure
 
 ```
 src/
-├── index.ts              # メインエントリポイント、MCPツール定義
-├── access-handler.ts     # Cloudflare Access OAuth認証ハンドラー
-├── matched-data.ts       # WAFペイロード復号化（HPKE）
-└── workers-oauth-utils.ts # OAuth/CSRF/PKCEユーティリティ
+├── index.ts              # Main entry point, MCP tool definitions
+├── access-handler.ts     # Cloudflare Access OAuth handler
+├── matched-data.ts       # WAF payload decryption (HPKE)
+└── workers-oauth-utils.ts # OAuth/CSRF/PKCE utilities
 ```
 
-## Logpush設定のヒント
+## Logpush Configuration Tips
 
-R2へのLogpush設定時、プレフィックスを分けると管理しやすくなります:
+When configuring Logpush to R2, using separate prefixes makes management easier:
 
-- HTTPリクエスト: `http_requests/{DATE}/`
-- ファイアウォールイベント: `firewall_events/{DATE}/`
+- HTTP requests: `http_requests/{DATE}/`
+- Firewall events: `firewall_events/{DATE}/`
 
-WAFペイロード復号化を利用する場合は、Logpushジョブのデータフィールドに **Metadata** を含めてください。
+If you use WAF payload decryption, make sure to include the **Metadata** field in your Logpush job data fields.
 
-## ログスキーマ
+## Log Schema
 
-### HTTP Requests 主要フィールド
+### HTTP Requests — Key Fields
 
-| フィールド | 説明 |
+| Field | Description |
 |---|---|
-| `EdgeStartTimestamp` | リクエスト受信タイムスタンプ |
-| `ClientIP` / `ClientCountry` | クライアント情報 |
-| `ClientRequestHost` / `ClientRequestMethod` / `ClientRequestPath` | リクエスト情報 |
-| `EdgeResponseStatus` / `OriginResponseStatus` | レスポンスステータス |
-| `CacheCacheStatus` | キャッシュ状態 |
-| `SecurityAction` / `SecurityRuleID` | セキュリティアクション |
-| `BotScore` / `BotScoreSrc` | Bot検出スコア |
-| `WAFAttackScore` / `WAFSQLiAttackScore` / `WAFXSSAttackScore` | WAF攻撃スコア |
-| `RayID` | リクエストID |
+| `EdgeStartTimestamp` | Request received timestamp |
+| `ClientIP` / `ClientCountry` | Client information |
+| `ClientRequestHost` / `ClientRequestMethod` / `ClientRequestPath` | Request details |
+| `EdgeResponseStatus` / `OriginResponseStatus` | Response status |
+| `CacheCacheStatus` | Cache status |
+| `SecurityAction` / `SecurityRuleID` | Security action |
+| `BotScore` / `BotScoreSrc` | Bot detection score |
+| `WAFAttackScore` / `WAFSQLiAttackScore` / `WAFXSSAttackScore` | WAF attack scores |
+| `RayID` | Request ID |
 
-### Firewall Events 主要フィールド
+### Firewall Events — Key Fields
 
-| フィールド | 説明 |
+| Field | Description |
 |---|---|
-| `Datetime` | イベント発生日時 |
-| `Action` | アクション（block, challenge, log 等） |
-| `ClientIP` / `ClientCountry` | クライアント情報 |
-| `ClientRequestHost` / `ClientRequestMethod` / `ClientRequestPath` | リクエスト情報 |
-| `Description` | ルール説明 |
-| `RuleID` | ルールID |
-| `Source` | セキュリティプロダクト（firewallManaged, firewallCustom 等） |
-| `Metadata` | メタデータ（`encrypted_matched_data`, `ruleset_version` 等） |
-| `LeakedCredentialCheckResult` | 漏洩認証情報チェック結果 |
-| `RayID` | リクエストID |
+| `Datetime` | Event timestamp |
+| `Action` | Action taken (block, challenge, log, etc.) |
+| `ClientIP` / `ClientCountry` | Client information |
+| `ClientRequestHost` / `ClientRequestMethod` / `ClientRequestPath` | Request details |
+| `Description` | Rule description |
+| `RuleID` | Rule ID |
+| `Source` | Security product (firewallManaged, firewallCustom, etc.) |
+| `Metadata` | Metadata (`encrypted_matched_data`, `ruleset_version`, etc.) |
+| `LeakedCredentialCheckResult` | Leaked credential check result |
+| `RayID` | Request ID |
 
-## 技術スタック
+## Tech Stack
 
-- [Cloudflare Workers](https://developers.cloudflare.com/workers/) — サーバーレス実行環境
-- [Cloudflare Durable Objects](https://developers.cloudflare.com/durable-objects/) — MCPセッション管理
-- [Cloudflare R2](https://developers.cloudflare.com/r2/) — ログストレージ
-- [Cloudflare KV](https://developers.cloudflare.com/kv/) — OAuth状態管理
-- [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) — 認証
+- [Cloudflare Workers](https://developers.cloudflare.com/workers/) — Serverless runtime
+- [Cloudflare Durable Objects](https://developers.cloudflare.com/durable-objects/) — MCP session management
+- [Cloudflare R2](https://developers.cloudflare.com/r2/) — Log storage
+- [Cloudflare KV](https://developers.cloudflare.com/kv/) — OAuth state management
+- [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/) — Authentication
 - [MCP SDK](https://github.com/modelcontextprotocol/typescript-sdk) — Model Context Protocol
 - [agents](https://github.com/cloudflare/agents) — Cloudflare Agents framework
-- [@hpke/core](https://github.com/dajiaji/hpke-js) — WAFペイロード復号化（HPKE）
+- [@hpke/core](https://github.com/dajiaji/hpke-js) — WAF payload decryption (HPKE)
 
-## ライセンス
+## License
 
 MIT
