@@ -95,10 +95,19 @@ function localDateToUTCRange(
 	const utcStart = new Date(Date.UTC(year, month - 1, day, -tzOffset, 0, 0));
 	const utcEnd = new Date(utcStart.getTime() + 24 * 60 * 60 * 1000);
 
-	// Collect all UTC dates that fall within the range
+	// Collect all UTC dates that fall within the half-open range [utcStart, utcEnd).
+	// Logpush stores files under <yyyymmdd>/, so a query like
+	// "2026-05-20 JST" (UTC 2026-05-19T15:00 ~ 2026-05-20T15:00) must include
+	// both `20260519/` (covers 15:00-23:59) and `20260520/` (covers 00:00-14:59).
+	// For pure UTC queries the range is exactly one calendar day, so only one
+	// directory is included (the `utcEnd` boundary is exclusive).
 	const utcDates = new Set<string>();
-	const cursor = new Date(utcStart);
-	while (cursor < utcEnd) {
+	const cursor = new Date(Date.UTC(
+		utcStart.getUTCFullYear(),
+		utcStart.getUTCMonth(),
+		utcStart.getUTCDate(),
+	));
+	while (cursor.getTime() < utcEnd.getTime()) {
 		const y = cursor.getUTCFullYear();
 		const m = String(cursor.getUTCMonth() + 1).padStart(2, "0");
 		const d = String(cursor.getUTCDate()).padStart(2, "0");
@@ -133,6 +142,34 @@ function toEpochMs(dt: unknown): number {
 	return NaN;
 }
 
+/**
+ * Parse the timestamp range encoded in a Logpush filename.
+ * Logpush keys look like: `<prefix>/20260411T000030Z_20260411T000100Z_<id>.log.gz`
+ * The first timestamp is the batch start, the second is the batch end.
+ * Returns null if the filename does not match.
+ */
+function parseLogpushFilenameRange(
+	key: string,
+): { startMs: number; endMs: number } | null {
+	const match = key.match(/(\d{8})T(\d{6})Z_(\d{8})T(\d{6})Z/);
+	if (!match) return null;
+	const [, d1, t1, d2, t2] = match;
+	const toIso = (d: string, t: string) =>
+		`${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}T${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)}Z`;
+	const startMs = new Date(toIso(d1, t1)).getTime();
+	const endMs = new Date(toIso(d2, t2)).getTime();
+	if (isNaN(startMs) || isNaN(endMs)) return null;
+	return { startMs, endMs };
+}
+
+/**
+ * Concurrency limit for parallel R2 object fetches.
+ * R2 binding I/O is cheap inside the same colo; running ~12-16 in parallel
+ * dramatically cuts wall time on prefixes with hundreds of small files
+ * (Logpush typically writes 1-10KB ndjson.gz per file).
+ */
+const R2_FETCH_CONCURRENCY = 16;
+
 async function forEachLogInR2(
 	bucket: R2Bucket,
 	prefixes: string | string[],
@@ -141,6 +178,7 @@ async function forEachLogInR2(
 ): Promise<{ totalEntries: number; filesProcessed: number; filteredEntries: number }> {
 	const prefixList = Array.isArray(prefixes) ? prefixes : [prefixes];
 	let filesProcessed = 0;
+	let filesSkippedByName = 0;
 	let totalEntries = 0;
 	let filteredEntries = 0;
 	let stopped = false;
@@ -149,6 +187,45 @@ async function forEachLogInR2(
 	const startMs = timeRange ? new Date(timeRange.start).getTime() : 0;
 	const endMs = timeRange ? new Date(timeRange.end).getTime() : 0;
 
+	// Process one R2 object: fetch, decompress, parse, invoke callback.
+	// Returns true if the caller signalled stop.
+	const processObject = async (key: string): Promise<boolean> => {
+		if (stopped) return true;
+		// Cheap filename-level pre-filter: skip whole files that fall outside
+		// the requested time window. Logpush filenames carry the batch range
+		// (`<start>_<end>_<id>.log.gz`), so this avoids fetching+gunzipping
+		// thousands of irrelevant 1KB objects when querying a tight window.
+		if (timeRange) {
+			const fileRange = parseLogpushFilenameRange(key);
+			if (fileRange && (fileRange.endMs < startMs || fileRange.startMs >= endMs)) {
+				filesSkippedByName++;
+				return false;
+			}
+		}
+		const r2Obj = await bucket.get(key);
+		if (!r2Obj) return false;
+		const text = await readR2ObjectText(r2Obj, key);
+		const logs = parseLogLines(text);
+		filesProcessed++;
+
+		for (const log of logs) {
+			totalEntries++;
+			if (timeRange) {
+				const dt = log.Datetime || log.EdgeStartTimestamp;
+				if (!dt) continue;
+				const ts = toEpochMs(dt);
+				if (isNaN(ts) || ts < startMs || ts >= endMs) continue;
+			}
+			filteredEntries++;
+			const result = callback(log);
+			if (result === false) {
+				stopped = true;
+				return true;
+			}
+		}
+		return false;
+	};
+
 	for (const prefix of prefixList) {
 		if (stopped) break;
 		let cursor: string | undefined;
@@ -156,34 +233,18 @@ async function forEachLogInR2(
 		do {
 			const listed = await bucket.list({
 				prefix,
-				limit: 100,
+				limit: 1000,
 				cursor,
 			});
 
-			for (const obj of listed.objects) {
+			// Process objects in parallel batches to amortize R2 latency.
+			for (let i = 0; i < listed.objects.length; i += R2_FETCH_CONCURRENCY) {
 				if (stopped) break;
-				const r2Obj = await bucket.get(obj.key);
-				if (!r2Obj) continue;
-
-				const text = await readR2ObjectText(r2Obj, obj.key);
-				const logs = parseLogLines(text);
-				filesProcessed++;
-
-				for (const log of logs) {
-					totalEntries++;
-					// Apply time range filter if specified
-					if (timeRange) {
-						const dt = log.Datetime || log.EdgeStartTimestamp;
-						if (!dt) continue; // No timestamp → skip when filtering by time
-						const ts = toEpochMs(dt);
-						if (isNaN(ts) || ts < startMs || ts >= endMs) continue;
-					}
-					filteredEntries++;
-					const result = callback(log);
-					if (result === false) {
-						stopped = true;
-						break;
-					}
+				const batch = listed.objects.slice(i, i + R2_FETCH_CONCURRENCY);
+				const results = await Promise.all(batch.map((obj) => processObject(obj.key)));
+				if (results.some((r) => r)) {
+					stopped = true;
+					break;
 				}
 			}
 
