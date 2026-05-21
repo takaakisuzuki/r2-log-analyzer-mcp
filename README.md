@@ -14,28 +14,43 @@ Runs on Cloudflare Workers with Cloudflare Access OAuth authentication, automati
 
 ## Architecture
 
-```
-┌──────────────┐     OAuth 2.1 + PKCE     ┌─────────────────────────┐
-│ MCP Client   │◄────────────────────────►│ Cloudflare Access       │
-│ (Claude etc) │                          │ (OIDC IdP)              │
-└──────┬───────┘                          └─────────────────────────┘
-       │ MCP Protocol (SSE)
-       ▼
-┌──────────────────────────────┐
-│ R2 Log Analyzer MCP Server   │
-│ (Cloudflare Worker)          │
-│                              │
-│  ┌─────────────────────────┐ │
-│  │ Durable Object          │ │     ┌──────────────────┐
-│  │ (McpAgent)              │ │────►│ R2: HTTP Logs    │
-│  │                         │ │     └──────────────────┘
-│  │  - Log query/analysis   │ │     ┌──────────────────┐
-│  │  - Payload decryption   │ │────►│ R2: WAF Logs     │
-│  │  - gzip decompression   │ │     └──────────────────┘
-│  └─────────────────────────┘ │
-│                              │     ┌──────────────────┐
-│  OAuth state & PKCE ─────────│────►│ KV: OAUTH_KV     │
-└──────────────────────────────┘     └──────────────────┘
+```mermaid
+flowchart LR
+    Client["🤖 MCP Client<br/>(Claude / Cursor / Windsurf)"]
+    Access["🔐 Cloudflare Access<br/>(OIDC IdP)"]
+
+    subgraph Worker["☁️ Cloudflare Worker — R2 Log Analyzer MCP Server"]
+        direction TB
+        DO["🧠 Durable Object (McpAgent)<br/>• Log query / analysis<br/>• Streaming aggregation<br/>• gzip decompression<br/>• WAF payload decryption"]
+        OAuth["🔑 OAuth Provider<br/>(state &amp; PKCE)"]
+    end
+
+    HTTPLogs[("📊 R2 Bucket<br/>HTTP Request Logs")]
+    WAFLogs[("🛡️ R2 Bucket<br/>WAF / Firewall Logs")]
+    KV[("🗝️ KV Namespace<br/>OAUTH_KV")]
+    Logpush["📤 Cloudflare Logpush"]
+
+    Client <-->|"OAuth 2.1 + PKCE"| Access
+    Client <-->|"MCP Protocol (SSE)"| Worker
+
+    DO -->|"list / get (parallel x16)"| HTTPLogs
+    DO -->|"list / get (parallel x16)"| WAFLogs
+    OAuth <--> KV
+
+    Logpush -.->|"ndjson.gz"| HTTPLogs
+    Logpush -.->|"ndjson.gz"| WAFLogs
+
+    classDef client fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef access fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef worker fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef storage fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef pipeline fill:#f1f5f9,stroke:#64748b,color:#0f172a
+
+    class Client client
+    class Access access
+    class DO,OAuth worker
+    class HTTPLogs,WAFLogs,KV storage
+    class Logpush pipeline
 ```
 
 ## Available Tools
