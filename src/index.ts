@@ -187,21 +187,39 @@ async function forEachLogInR2(
 	const startMs = timeRange ? new Date(timeRange.start).getTime() : 0;
 	const endMs = timeRange ? new Date(timeRange.end).getTime() : 0;
 
-	// Process one R2 object: fetch, decompress, parse, invoke callback.
-	// Returns true if the caller signalled stop.
+	// Phase 1: LIST every prefix and collect candidate keys.
+	// We exhaust all `bucket.list()` pages first so that we can apply the
+	// filename-level timestamp filter before issuing any GETs. This is the
+	// critical optimization for HTTP logs, where Logpush writes 800-1000
+	// 1KB files per day. Listing is cheap (Class B operations), but GETs
+	// are the wall-time bottleneck.
+	const candidateKeys: string[] = [];
+	for (const prefix of prefixList) {
+		let cursor: string | undefined;
+		do {
+			const listed = await bucket.list({
+				prefix,
+				limit: 1000,
+				cursor,
+			});
+			for (const obj of listed.objects) {
+				// Apply filename-level pre-filter while collecting keys.
+				if (timeRange) {
+					const fileRange = parseLogpushFilenameRange(obj.key);
+					if (fileRange && (fileRange.endMs < startMs || fileRange.startMs >= endMs)) {
+						filesSkippedByName++;
+						continue;
+					}
+				}
+				candidateKeys.push(obj.key);
+			}
+			cursor = listed.truncated ? listed.cursor : undefined;
+		} while (cursor);
+	}
+
+	// Phase 2: parallel-fetch each candidate, decompress, parse, invoke callback.
 	const processObject = async (key: string): Promise<boolean> => {
 		if (stopped) return true;
-		// Cheap filename-level pre-filter: skip whole files that fall outside
-		// the requested time window. Logpush filenames carry the batch range
-		// (`<start>_<end>_<id>.log.gz`), so this avoids fetching+gunzipping
-		// thousands of irrelevant 1KB objects when querying a tight window.
-		if (timeRange) {
-			const fileRange = parseLogpushFilenameRange(key);
-			if (fileRange && (fileRange.endMs < startMs || fileRange.startMs >= endMs)) {
-				filesSkippedByName++;
-				return false;
-			}
-		}
 		const r2Obj = await bucket.get(key);
 		if (!r2Obj) return false;
 		const text = await readR2ObjectText(r2Obj, key);
@@ -226,30 +244,14 @@ async function forEachLogInR2(
 		return false;
 	};
 
-	for (const prefix of prefixList) {
+	for (let i = 0; i < candidateKeys.length; i += R2_FETCH_CONCURRENCY) {
 		if (stopped) break;
-		let cursor: string | undefined;
-
-		do {
-			const listed = await bucket.list({
-				prefix,
-				limit: 1000,
-				cursor,
-			});
-
-			// Process objects in parallel batches to amortize R2 latency.
-			for (let i = 0; i < listed.objects.length; i += R2_FETCH_CONCURRENCY) {
-				if (stopped) break;
-				const batch = listed.objects.slice(i, i + R2_FETCH_CONCURRENCY);
-				const results = await Promise.all(batch.map((obj) => processObject(obj.key)));
-				if (results.some((r) => r)) {
-					stopped = true;
-					break;
-				}
-			}
-
-			cursor = listed.truncated ? listed.cursor : undefined;
-		} while (cursor && !stopped);
+		const batch = candidateKeys.slice(i, i + R2_FETCH_CONCURRENCY);
+		const results = await Promise.all(batch.map(processObject));
+		if (results.some((r) => r)) {
+			stopped = true;
+			break;
+		}
 	}
 
 	return { totalEntries, filesProcessed, filteredEntries };
